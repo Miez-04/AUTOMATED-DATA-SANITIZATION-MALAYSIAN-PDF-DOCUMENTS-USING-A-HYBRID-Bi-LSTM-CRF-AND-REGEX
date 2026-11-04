@@ -56,6 +56,7 @@ button:active:not(:disabled) { transform: translateY(1px); }
 .controls .checkbox-row label { color: var(--ink); }
 .controls #run-btn { margin-left: auto; }
 
+[hidden] { display: none !important; }
 .switch-row { display: inline-flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 650; cursor: pointer; user-select: none; color: var(--ink); }
 .switch { position: relative; width: 44px; height: 24px; flex: none; }
 .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
@@ -141,13 +142,13 @@ tr:has(.label-ADDRESS) td { background: rgba(220,38,38,.07); }
     <input type="checkbox" id="no-model-check">
     <label for="no-model-check">Tier 1 only (no model)</label>
   </div>
-  <label class="switch-row" for="heuristic-toggle">
+  <label class="switch-row" for="heuristic-toggle" data-heuristic-ui hidden>
     <span>Address heuristic</span>
-    <span class="switch"><input type="checkbox" id="heuristic-toggle" checked><span class="slider"></span></span>
-    <span class="switch-state" id="heuristic-state">ON</span>
+    <span class="switch"><input type="checkbox" id="heuristic-toggle"><span class="slider"></span></span>
+    <span class="switch-state" id="heuristic-state">OFF</span>
   </label>
-  <label for="checkpoint-input">Checkpoint</label>
-  <input type="text" id="checkpoint-input" placeholder="models/checkpoints_v25_ns/best_model.pt">
+  <label for="checkpoint-input">Model checkpoint (leave empty to use the server's model)</label>
+  <input type="text" id="checkpoint-input" placeholder="Loading server model…">
   <button onclick="runAnalysis()" id="run-btn">Run</button>
 </div>
 
@@ -190,14 +191,14 @@ async function runAnalysis() {
   }
   const runBtn = document.getElementById("run-btn");
   runBtn.disabled = true;
-  setStatus("Running pipeline…");
+  startWaitTimer("Running pipeline…");
   document.getElementById("results").innerHTML = "";
   document.getElementById("empty-state").style.display = "none";
 
   const form = new FormData();
   form.append("file", fileInput.files[0]);
   form.append("no_model", document.getElementById("no-model-check").checked ? "true" : "false");
-  form.append("address_heuristic", document.getElementById("heuristic-toggle").checked ? "true" : "false");
+  if (SHOW_ADDRESS_HEURISTIC) form.append("address_heuristic", document.getElementById("heuristic-toggle").checked ? "true" : "false");  // field missing = server default
   const checkpoint = document.getElementById("checkpoint-input").value.trim();
   if (checkpoint) form.append("checkpoint", checkpoint);
 
@@ -206,23 +207,60 @@ async function runAnalysis() {
     const data = await res.json();
     runBtn.disabled = false;
     if (!res.ok) {
-      setStatus("Error: " + (data.error || res.statusText));
+      const failedAfter = stopWaitTimer();
+      setStatus(`Error after ${failedAfter.toFixed(1)} s: ` + (data.error || res.statusText));
       return;
     }
     lastFilename = data.filename;
     lastPages = data.pages;
-    setStatus(`${data.filename} — ${data.pages.length} page(s) — address heuristic: ${data.address_heuristic ? "ON" : "OFF"}`);
+    const waited = stopWaitTimer();   // float seconds from click to response
+    const modelPart = data.checkpoint ? `model: ${data.checkpoint}` : "Tier 1 only (no model)";
+    const heuristicPart = SHOW_ADDRESS_HEURISTIC ? ` — address heuristic: ${data.address_heuristic ? "ON" : "OFF"}` : "";
+    setStatus(`${data.filename} — ${data.pages.length} page(s) — ${modelPart}${heuristicPart} — ${waited.toFixed(1)} s`);
     document.getElementById("filter-row").style.display = "flex";
     document.getElementById("download-btn").disabled = false;
     renderPages(data.pages);
   } catch (err) {
     runBtn.disabled = false;
-    setStatus("Error: " + err.message);
+    const failedAfter = stopWaitTimer();
+    setStatus(`Error after ${failedAfter.toFixed(1)} s: ` + err.message);
   }
 }
 
 function setStatus(msg) {
   document.getElementById("status").textContent = msg;
+}
+
+// The address heuristic controls are hidden. The heuristic code stays in the project.
+// To show the slider again, set this to true (the page then sends the slider value).
+const SHOW_ADDRESS_HEURISTIC = false;
+document.querySelectorAll("[data-heuristic-ui]").forEach(el => { el.hidden = !SHOW_ADDRESS_HEURISTIC; });
+
+// Show which model the server uses when the checkpoint field is left empty.
+fetch("/api/config")
+  .then(r => r.json())
+  .then(cfg => { document.getElementById("checkpoint-input").placeholder = "Server default: " + cfg.default_checkpoint; })
+  .catch(() => { document.getElementById("checkpoint-input").placeholder = "Server default model"; });
+
+// ---------------- Wait timer ----------------
+// Output: status text "<label> <seconds> s", refreshed every 100 ms until stopWaitTimer().
+let waitTimerId = null;   // number returned by setInterval, or null when no timer is running
+let waitStartMs = 0;      // float: performance.now() when the wait began
+
+function startWaitTimer(label) {
+  stopWaitTimer();
+  waitStartMs = performance.now();
+  const tick = () => setStatus(`${label} ${((performance.now() - waitStartMs) / 1000).toFixed(1)} s`);
+  tick();
+  waitTimerId = setInterval(tick, 100);
+}
+
+// Output: float, seconds waited (0 if no timer was running).
+function stopWaitTimer() {
+  if (waitTimerId === null) return 0;
+  clearInterval(waitTimerId);
+  waitTimerId = null;
+  return (performance.now() - waitStartMs) / 1000;
 }
 
 function renderPages(pages) {

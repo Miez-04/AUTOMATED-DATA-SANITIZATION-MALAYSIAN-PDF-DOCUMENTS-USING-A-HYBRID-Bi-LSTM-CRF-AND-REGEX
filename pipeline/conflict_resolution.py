@@ -18,6 +18,22 @@ would merge into the wrong entity in pipeline.coordinate_merge (or get
 silently dropped depending on how strict the merge is). repair_iob2()
 below is a required second pass, not optional cleanup: run it every
 time, not just when something looks wrong.
+
+Architecture decision (FYP report sections 3.2.1 and 3.3.1): the gate is
+one deterministic registry lookup plus Tier 2's prediction. Tier 1 (regex)
+covers NRIC and PHONE only; ADDRESS comes from Tier 2 only. Two rule-based
+ADDRESS post-processors still exist in this file but are OFF by default and
+can be switched on per request or per process, so they stay available for
+ablation experiments (eval/ablate_combine.py):
+
+    1. address heuristic   (_fill_address_gaps_with_heuristic)
+       on : address_heuristic(True)  or env PDFSAN_ADDRESS_HEURISTIC=1
+    2. address post-filter (_reject_implausible_model_address)
+       on : address_postfilter(True) or env PDFSAN_ADDRESS_POSTFILTER=1
+
+Measured with a perfect Tier 2 on the dedup holdout (1,047 gold ADDRESS
+spans): both off = ADDRESS F1 0.9971 -> 1.0000 after the post-filter fixes
+below, heuristic on = 0.9213.
 """
 
 from __future__ import annotations
@@ -48,6 +64,11 @@ HEURISTIC_SOURCE = "address_heuristic"
 # Minimum CRF marginal probability (see models.bilstm_crf.BiLSTMCRF.marginals
 # / pipeline.inference.TierTwoPredictor.predict_page_with_confidence) a
 # model-only PERSON/ADDRESS span must clear to survive into redaction.
+#
+# CURRENT VALUE 0 = NO automatic rejection, on purpose: FYP report 3.3.1
+# says low-confidence and borderline Tier 2 predictions are not rejected
+# at the gate; they are shown to the operator in the human-in-the-loop
+# step (Step 4). The history below explains the earlier 0.5 / 0.7 values.
 # NRIC/PHONE are excluded here: they have their own stricter, deterministic
 # plausibility check below (_reject_implausible_model_nric_phone) that a
 # probability threshold can't improve on.
@@ -125,7 +146,8 @@ def resolve_page(
     # "B-" token, so a model span that begins with a dangling "I-X"
     # would skip every check and be converted to "B-X" afterwards.
     repair_iob2(page)
-    _reject_implausible_model_address(page)
+    if address_postfilter_enabled():  # OFF by default (report 3.3.1); on via address_postfilter(True) / env
+        _reject_implausible_model_address(page)
     _reject_implausible_model_nric_phone(page)  # defensive no-op now for
                                                   # NRIC/PHONE (no model-
                                                   # sourced tokens of those
@@ -134,7 +156,7 @@ def resolve_page(
                                                   # decision is ever revisited
     _reject_low_confidence_model_predictions(page)
     repair_iob2(page)
-    _fill_address_gaps_with_heuristic(page)
+    _fill_address_gaps_with_heuristic(page)  # returns 0 immediately unless address_heuristic_enabled()
 
 
 def _reject_low_confidence_model_predictions(
@@ -176,9 +198,11 @@ def _reject_low_confidence_model_predictions(
 # ---- address-heuristic on/off switch ------------------------------------
 # Resolution order: (1) a per-request override set with address_heuristic(...)
 # below (used by the web UI toggle), (2) the environment variable
-# PDFSAN_NO_ADDRESS_HEURISTIC=1 (turns it off for the whole process),
-# (3) default: ON. A context variable is used, not a global, so two
-# requests handled at the same time cannot change each other's setting.
+# PDFSAN_NO_ADDRESS_HEURISTIC=1 (forces it off for the whole process),
+# (3) the environment variable PDFSAN_ADDRESS_HEURISTIC=1 (turns it on for
+# the whole process), (4) default: OFF. A context variable is used, not a
+# global, so two requests handled at the same time cannot change each
+# other's setting.
 _ADDRESS_HEURISTIC_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
     "address_heuristic_override", default=None
 )
@@ -189,7 +213,9 @@ def address_heuristic_enabled() -> bool:
     override = _ADDRESS_HEURISTIC_OVERRIDE.get()  # True / False / None (= no override)
     if override is not None:
         return override
-    return os.environ.get("PDFSAN_NO_ADDRESS_HEURISTIC") != "1"
+    if os.environ.get("PDFSAN_NO_ADDRESS_HEURISTIC") == "1":
+        return False
+    return os.environ.get("PDFSAN_ADDRESS_HEURISTIC") == "1"  # default OFF
 
 
 @contextlib.contextmanager
@@ -201,6 +227,36 @@ def address_heuristic(enabled: bool | None):
         yield
     finally:
         _ADDRESS_HEURISTIC_OVERRIDE.reset(token)
+
+
+# ---- address post-filter on/off switch ----------------------------------
+# Controls _reject_implausible_model_address inside resolve_page. Same
+# resolution order idea as the heuristic switch: (1) per-call override set
+# with address_postfilter(...), (2) env PDFSAN_ADDRESS_POSTFILTER=1,
+# (3) default: OFF. Calling _reject_implausible_model_address(page)
+# directly is never affected by this switch.
+_ADDRESS_POSTFILTER_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
+    "address_postfilter_override", default=None
+)
+
+
+def address_postfilter_enabled() -> bool:
+    """True if resolve_page should run the ADDRESS plausibility post-filter."""
+    override = _ADDRESS_POSTFILTER_OVERRIDE.get()  # True / False / None (= no override)
+    if override is not None:
+        return override
+    return os.environ.get("PDFSAN_ADDRESS_POSTFILTER") == "1"  # default OFF
+
+
+@contextlib.contextmanager
+def address_postfilter(enabled: bool | None):
+    """with address_postfilter(True): resolve_page(...) -> post-filter on
+    inside the block only. Passing None means 'no override' (env/default)."""
+    token = _ADDRESS_POSTFILTER_OVERRIDE.set(enabled)
+    try:
+        yield
+    finally:
+        _ADDRESS_POSTFILTER_OVERRIDE.reset(token)
 
 
 def _fill_address_gaps_with_heuristic(page: PageTokens) -> int:
@@ -220,6 +276,12 @@ def _fill_address_gaps_with_heuristic(page: PageTokens) -> int:
     CURRENTLY ENTIRELY "O" — i.e. genuine gaps the model missed
     completely (the real resume-PDF failure mode this was built for),
     never touching a token the model already made any prediction for.
+
+    OFF by default (FYP report 3.2.1 / 3.3.1: ADDRESS is Tier 2's job).
+    Measured with a perfect Tier 2: it lowered ADDRESS F1 from 0.9971 to
+    0.9213 on the dedup holdout, because the span it writes can replace a
+    correct model span with a longer one (extra leading registration
+    numbers, trailing "No. Telefon:", merging across unrelated text).
     """
     if not address_heuristic_enabled():  # per-request UI switch / env switch
         return 0
@@ -271,6 +333,28 @@ def _fill_address_gaps_with_heuristic(page: PageTokens) -> int:
     return filled
 
 
+# Extra anchors used ONLY by the plausibility check below, not by the
+# heuristic's address finder, so the finder's false-positive guard for
+# common words is unchanged.
+_PLAUSIBILITY_EXTRA_ANCHORS = {"suite", "level", "aras"}
+
+
+def _is_anchor_token(text: str) -> bool:
+    """Input : text (str), one token such as "NO.", "Jalan," or "Pt.".
+    Output: bool, True if the token is an address anchor word.
+
+    Keeps a trailing "." so entries written with a period in
+    ADDRESS_ANCHOR_KEYWORDS ("no.", "pt.", "lor.", "pers.") still match.
+    The old check stripped the period first, so "NO." became "no", which
+    is deliberately NOT in the set. Bare "no" stays excluded."""
+    w = text.lower().strip(",;:()")  # str: lowercase, commas/brackets removed, period kept
+    return (
+        w in ADDRESS_ANCHOR_KEYWORDS
+        or w.rstrip(".") in ADDRESS_ANCHOR_KEYWORDS
+        or w in _PLAUSIBILITY_EXTRA_ANCHORS
+    )
+
+
 def _reject_implausible_model_address(page: PageTokens) -> int:
     """Cross-checks model-predicted ADDRESS spans against the SAME
     structural definition of a real Malaysian address that
@@ -313,11 +397,12 @@ def _reject_implausible_model_address(page: PageTokens) -> int:
             has_model_token = any(t.source == MODEL_SOURCE for t in span)
             if has_model_token:
                 has_postcode = any(_is_plausible_postcode(t.text) for t in span)
-                has_state = any(t.text.lower() in _STATE_TOKENS for t in span)
-                has_anchor = any(
-                    t.text.lower().rstrip(".,") in ADDRESS_ANCHOR_KEYWORDS
-                    for t in span
+                # Same normalisation the heuristic uses for states: strip
+                # ",.;:()" first, so "Perak," matches "perak".
+                has_state = any(
+                    t.text.lower().strip(",.;:()") in _STATE_TOKENS for t in span
                 )
+                has_anchor = any(_is_anchor_token(t.text) for t in span)
                 plausible = has_postcode or has_state or has_anchor
 
                 if not plausible:

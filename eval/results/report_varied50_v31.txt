@@ -1,0 +1,38 @@
+=== tier1_only (micro F1 = 0.5938) ===
+              precision    recall  f1-score   support
+
+     ADDRESS     0.0000    0.0000    0.0000        54
+        NRIC     1.0000    1.0000    1.0000        70
+      PERSON     0.0000    0.0000    0.0000        80
+       PHONE     0.6322    0.9167    0.7483        60
+
+   micro avg     0.7962    0.4735    0.5938       264
+   macro avg     0.4080    0.4792    0.4371       264
+weighted avg     0.4088    0.4735    0.4352       264
+
+
+=== tier2_only (micro F1 = 0.7886) ===
+              precision    recall  f1-score   support
+
+     ADDRESS     0.6104    0.8704    0.7176        54
+        NRIC     0.9565    0.9429    0.9496        70
+      PERSON     0.7692    0.6250    0.6897        80
+       PHONE     0.6705    0.9833    0.7973        60
+
+   micro avg     0.7425    0.8409    0.7886       264
+   macro avg     0.7516    0.8554    0.7885       264
+weighted avg     0.7640    0.8409    0.7888       264
+
+
+=== combined (micro F1 = 0.7886) ===
+              precision    recall  f1-score   support
+
+     ADDRESS     0.6104    0.8704    0.7176        54
+        NRIC     1.0000    1.0000    1.0000        70
+      PERSON     0.7692    0.6250    0.6897        80
+       PHONE     0.6322    0.9167    0.7483        60
+
+   micro avg     0.7425    0.8409    0.7886       264
+   macro avg     0.7530    0.8530    0.7889       264
+weighted avg     0.7668    0.8409    0.7910       264
+

@@ -64,6 +64,7 @@ button:active:not(:disabled) { transform: translateY(1px); }
 .trust svg { flex: none; }
 .feature-row { display: none; }
 
+[hidden] { display: none !important; }  /* an element's own display rule must not override the hidden attribute */
 /* ---------- on/off slider (address heuristic) ---------- */
 .switch-row { display: inline-flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 600; cursor: pointer; user-select: none; }
 .switch { position: relative; width: 44px; height: 24px; flex: none; }
@@ -117,8 +118,8 @@ button:active:not(:disabled) { transform: translateY(1px); }
 #review { display: none; }
 .filename-bar { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 28px; background: #fff; border-bottom: 1px solid var(--border); }
 .filename-chip { background: var(--bg); color: var(--ink); padding: 5px 13px; border-radius: 8px; font-weight: 650; font-size: 13px; display: inline-block; }
-#heuristic-chip { background: transparent; border: 1px solid var(--border); color: var(--ink-soft); font-weight: 600; margin-left: 0 !important; }
-#heuristic-chip:empty, #filename-chip:empty { display: none; }
+#heuristic-chip, #time-chip { background: transparent; border: 1px solid var(--border); color: var(--ink-soft); font-weight: 600; margin-left: 0 !important; }
+#heuristic-chip:empty, #filename-chip:empty, #time-chip:empty { display: none; }
 .layout { display: flex; gap: 20px; padding: 20px 28px 32px; }
 .sidebar { width: 96px; display: flex; flex-direction: column; gap: 10px; max-height: 78vh; overflow-y: auto; }
 .thumb { background: #fff; border: 2px solid transparent; border-radius: 8px; padding: 6px; cursor: pointer; text-align: center; font-size: 11px; color: var(--text-muted); }
@@ -264,11 +265,11 @@ button:active:not(:disabled) { transform: translateY(1px); }
         </label>
       </div>
 
-      <div class="options">
+      <div class="options" data-heuristic-ui hidden>
         <label class="switch-row" for="heuristic-toggle">
           <span>Address heuristic</span>
-          <span class="switch"><input type="checkbox" id="heuristic-toggle" checked><span class="slider"></span></span>
-          <span class="switch-state" id="heuristic-state">ON</span>
+          <span class="switch"><input type="checkbox" id="heuristic-toggle"><span class="slider"></span></span>
+          <span class="switch-state" id="heuristic-state">OFF</span>
         </label>
         <p class="option-note">Adds street and postcode rules on top of the model. Switch it off to see only what the Bi-LSTM-CRF model finds.</p>
       </div>
@@ -307,7 +308,7 @@ button:active:not(:disabled) { transform: translateY(1px); }
 
 <!-- ============ REVIEW ============ -->
 <div id="review">
-  <div class="filename-bar"><span class="filename-chip" id="filename-chip"></span> <span class="filename-chip" id="heuristic-chip" style="margin-left:8px;"></span></div>
+  <div class="filename-bar"><span class="filename-chip" id="filename-chip"></span> <span class="filename-chip" id="heuristic-chip" data-heuristic-ui hidden style="margin-left:8px;"></span> <span class="filename-chip" id="time-chip" style="margin-left:8px;"></span></div>
 
   <div class="layout">
     <div class="sidebar" id="thumb-sidebar"></div>
@@ -406,16 +407,47 @@ document.body.addEventListener("drop", (e) => {
   if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
 });
 
+// The address heuristic controls are hidden. The heuristic code stays in the project
+// (pipeline/conflict_resolution.py, ui/server.py). To show the slider and chip again,
+// set this to true: the page then sends the slider value with every upload.
+const SHOW_ADDRESS_HEURISTIC = false;
+document.querySelectorAll("[data-heuristic-ui]").forEach(el => { el.hidden = !SHOW_ADDRESS_HEURISTIC; });
+
 const heuristicToggle = document.getElementById("heuristic-toggle");
 heuristicToggle.addEventListener("change", () => {
   document.getElementById("heuristic-state").textContent = heuristicToggle.checked ? "ON" : "OFF";
 });
 
+// ---------------- Wait timer ----------------
+// Input : label (str) shown in the banner while the server works.
+// Output: banner text "<label> <seconds> s", refreshed every 100 ms until stopWaitTimer().
+let waitTimerId = null;   // number returned by setInterval, or null when no timer is running
+let waitStartMs = 0;      // float: performance.now() when the wait began
+
+function startWaitTimer(label) {
+  stopWaitTimer();                                   // never run two timers at once
+  waitStartMs = performance.now();
+  const tick = () => {
+    const secs = (performance.now() - waitStartMs) / 1000;   // float seconds since the wait began
+    showStatus(`${label} ${secs.toFixed(1)} s`, 0);          // ms = 0: banner stays until replaced
+  };
+  tick();
+  waitTimerId = setInterval(tick, 100);
+}
+
+// Output: float, seconds waited (0 if no timer was running).
+function stopWaitTimer() {
+  if (waitTimerId === null) return 0;
+  clearInterval(waitTimerId);
+  waitTimerId = null;
+  return (performance.now() - waitStartMs) / 1000;
+}
+
 async function uploadFile(file) {
-  showStatus("Analyzing document…", 0);
+  startWaitTimer("Analyzing document…");
   const form = new FormData();
   form.append("file", file);
-  form.append("address_heuristic", heuristicToggle.checked ? "true" : "false");
+  if (SHOW_ADDRESS_HEURISTIC) form.append("address_heuristic", heuristicToggle.checked ? "true" : "false");  // field missing = server default
   try {
     const res = await fetch("/api/upload", { method: "POST", body: form });
     if (!res.ok) throw new Error((await res.json()).error || "Upload failed");
@@ -428,7 +460,7 @@ async function uploadFile(file) {
     data.pages.forEach(p => pageDims[p.page] = { width: p.width, height: p.height });
 
     document.getElementById("filename-chip").textContent = data.filename;
-    document.getElementById("heuristic-chip").textContent = "Address heuristic: " + (data.address_heuristic ? "ON" : "OFF");
+    if (SHOW_ADDRESS_HEURISTIC) document.getElementById("heuristic-chip").textContent = "Address heuristic: " + (data.address_heuristic ? "ON" : "OFF");
     document.getElementById("landing").style.display = "none";
     document.getElementById("review").style.display = "block";
     document.getElementById("review-topbar-actions").style.display = "flex";
@@ -438,13 +470,17 @@ async function uploadFile(file) {
     renderEntityList();
     updateTotals();
     goToPage(1);
-    document.getElementById("status-banner").style.display = "none";
+    const waited = stopWaitTimer();   // float seconds from upload click to finished render
+    document.getElementById("time-chip").textContent = `Analyzed in ${waited.toFixed(1)} s`;
+    showStatus(`Done in ${waited.toFixed(1)} s`, 2500);
   } catch (err) {
-    showStatus("Error: " + err.message, 4000);
+    const waited = stopWaitTimer();
+    showStatus(`Error after ${waited.toFixed(1)} s: ` + err.message, 4000);
   }
 }
 
 function resetToLanding() {
+  document.getElementById("time-chip").textContent = "";
   document.getElementById("review").style.display = "none";
   document.getElementById("review-topbar-actions").style.display = "none";
   document.getElementById("landing").style.display = "flex";
@@ -864,16 +900,29 @@ async function addOwnWord() {
   });
   const data = await res.json();
   document.getElementById("status-banner").style.display = "none";
-  if (!data.entities || data.entities.length === 0) {
-    showStatus(`No matches found for "${phrase}"`, 2500);
+  if (data.error) { showStatus(data.error, 3000); return; }
+  const c = data.counts || { added: 0, extended: 0, retyped: 0, covered: 0 };
+  if (data.removed_ids && data.removed_ids.length) {      // highlights replaced by a wider or retyped one
+    const gone = new Set(data.removed_ids);
+    entities = entities.filter(e => !gone.has(e.id));
+    gone.forEach(id => excludedIds.delete(id));
+  }
+  const found = c.added + c.extended + c.retyped + c.covered;
+  if (found === 0) {
+    showStatus(`No matches found for "${phrase}". If it is visible but split across columns or lines, use Draw to select it.`, 4500);
     return;
   }
-  entities = entities.concat(data.entities);
+  entities = entities.concat(data.entities || []);
   buildPillFilters();
   renderEntityList();
   updateTotals();
   renderOverlays();
-  showStatus(`Added ${data.entities.length} match(es) for "${phrase}"`, 2500);
+  const parts = [];
+  if (c.added) parts.push(`${c.added} added`);
+  if (c.extended) parts.push(`${c.extended} widened`);
+  if (c.retyped) parts.push(`${c.retyped} retyped`);
+  if (c.covered) parts.push(`${c.covered} already highlighted`);
+  showStatus(`"${phrase}": ` + parts.join(", ") + (data.inside_token ? " (found inside longer words; the whole word is masked)" : ""), 4000);
 }
 document.getElementById("mask-own-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") addOwnWord();

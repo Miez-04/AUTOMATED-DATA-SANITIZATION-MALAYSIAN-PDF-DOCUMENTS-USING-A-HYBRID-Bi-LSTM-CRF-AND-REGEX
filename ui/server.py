@@ -25,7 +25,9 @@ Then open http://127.0.0.1:5000 in a browser.
 from __future__ import annotations
 
 import io
+import os
 import sys
+import unicodedata
 import tempfile
 import uuid
 from pathlib import Path
@@ -56,7 +58,16 @@ from regex_engine.matcher import build_regex_mask_registry
 
 app = Flask(__name__, static_folder=str(Path(__file__).parent / "static"))
 
-DEFAULT_CHECKPOINT = "models/checkpoints_v28_ns/best_model.pt"
+# The model the server uses when a request does not name one. Change it here, or
+# without editing code: set PDFSAN_CHECKPOINT=models/checkpoints_vXX_ns/best_model.pt
+# before starting the server. Both web pages follow this value.
+DEFAULT_CHECKPOINT = os.environ.get("PDFSAN_CHECKPOINT", "models/checkpoints_v31_ns/best_model.pt")
+
+
+def _checkpoint_from_form() -> str:
+    """Checkpoint named in the request, or DEFAULT_CHECKPOINT when the field is
+    missing or empty."""
+    return (request.form.get("checkpoint") or "").strip() or DEFAULT_CHECKPOINT
 
 # Whether the installed EntitySpan dataclass has a confidence field —
 # only true if the confidence-scoring pipeline patch has been applied.
@@ -116,13 +127,19 @@ def index():
     return send_from_directory(app.static_folder, "index.html")
 
 
+@app.route("/api/config")
+def config():
+    """What the web pages need to show about the server: the model it uses by default."""
+    return jsonify({"default_checkpoint": DEFAULT_CHECKPOINT})
+
+
 @app.route("/api/upload", methods=["POST"])
 def upload():
     file = request.files.get("file")
     if file is None or not file.filename:
         return jsonify({"error": "No file uploaded"}), 400
 
-    checkpoint_path = request.form.get("checkpoint", DEFAULT_CHECKPOINT)
+    checkpoint_path = _checkpoint_from_form()
 
     doc_id = uuid.uuid4().hex
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"pdfsan_{doc_id}_"))
@@ -284,6 +301,107 @@ def _bbox_center_inside(token_bbox, x0: float, y0: float, x1: float, y1: float) 
 ALLOWED_MASK_TYPES = {"PERSON", "NRIC", "PHONE", "ADDRESS", "OTHER"}
 
 
+def _norm_search(text: str) -> str:
+    """Input : any text (str). Output: str with only lower-case letters and digits.
+    Quotes, dashes, slashes, commas, brackets and spaces are removed, so
+    "Rahmat," matches "Rahmat", "950325 - 10 - 6124" matches "950325-10-6124",
+    and "SA\u2019DUN" matches "SA'DUN"."""
+    text = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def find_phrase_token_ranges(token_texts: list[str], phrase: str):
+    """Input : token_texts (list of str, one page in reading order), phrase (str).
+    Output: (ranges, inside_token) where ranges is a list of (first_index, last_index)
+    token ranges, last_index inclusive, and inside_token is True when the matches were
+    found only INSIDE a longer token.
+
+    Step 1: strip every token and the phrase down to letters and digits (see _norm_search)
+    and join the tokens into one string, so a name split over several tokens, a MyKad
+    split into "950325 - 10 - 6124" or a phone split as "012-345 6789" is still one run
+    of characters. Step 2: find the phrase in that string. A match counts when it starts
+    where a token starts and ends where a token ends. Step 3: only when nothing matched
+    that way, accept a match that lies entirely inside ONE token ("Maybank" inside
+    "Menara-Maybank,"), so a search never invents a match across two words."""
+    target = _norm_search(phrase)
+    if not target:
+        return [], False
+    joined, owner, starts, ends = [], [], {}, {}
+    for idx, text in enumerate(token_texts):
+        norm = _norm_search(text)
+        if not norm:
+            continue                                   # pure punctuation token: contributes no characters
+        starts[idx] = len("".join(joined))
+        joined.append(norm)
+        owner.extend([idx] * len(norm))
+        ends[idx] = len("".join(joined))
+    hay = "".join(joined)                              # str: all token texts, letters and digits only
+
+    ranges, pos = [], 0
+    while True:
+        at = hay.find(target, pos)
+        if at < 0:
+            break
+        first, last = owner[at], owner[at + len(target) - 1]
+        if starts[first] == at and ends[last] == at + len(target):
+            ranges.append((first, last))
+            pos = at + len(target)                     # matches never overlap
+        else:
+            pos = at + 1
+    if ranges:
+        return ranges, False
+
+    inside, pos = [], 0
+    while True:
+        at = hay.find(target, pos)
+        if at < 0:
+            break
+        first, last = owner[at], owner[at + len(target) - 1]
+        if first == last:                              # entirely inside one token
+            inside.append((first, last))
+            pos = ends[last]
+        else:
+            pos = at + 1
+    return inside, bool(inside)
+
+
+def merge_manual_match(page, spans_by_id: dict, first: int, last: int, entity_type: str):
+    """Input : page (PageTokens), spans_by_id (dict id -> EntitySpan, edited in place),
+    first / last (int, token positions of one manual match, last inclusive), entity_type (str).
+    Output: (new_span or None, removed_ids list of str, outcome str).
+
+    Rule: a manual match only ADDS or WIDENS. It never makes a highlight smaller, so it can
+    never un-mask something that was already masked.
+      no highlight overlaps the match                  -> "added"
+      same tokens, same type                           -> "covered"   (nothing changes)
+      an existing highlight is larger than the match   -> "covered"   (keep the larger one)
+      same tokens, different type                      -> "retyped"   (the type you chose wins)
+      match is larger than, or overlaps, a highlight   -> "extended"  (old highlight replaced by the union)
+    To make a highlight smaller, use Reselect or delete it."""
+    match_tokens = page.tokens[first:last + 1]
+    wanted = {t.token_index for t in match_tokens}                    # set of int: token indices of the match
+    overlapping = [(sid, sp) for sid, sp in spans_by_id.items()
+                   if sp.page_num == page.page_num and wanted & set(sp.token_indices)]
+    if not overlapping:
+        return _build_entity_span(match_tokens, entity_type, page.page_num, source="manual"), [], "added"
+    for _sid, sp in overlapping:
+        existing = set(sp.token_indices)
+        if wanted < existing:                                         # existing highlight is strictly larger
+            return None, [], "covered"
+    if len(overlapping) == 1:
+        sid, sp = overlapping[0]
+        if set(sp.token_indices) == wanted:
+            if sp.entity_type == entity_type:
+                return None, [], "covered"
+            return _build_entity_span(match_tokens, entity_type, page.page_num, source="manual"), [sid], "retyped"
+    union = set(wanted)
+    for _sid, sp in overlapping:
+        union |= set(sp.token_indices)
+    union_tokens = sorted((t for t in page.tokens if t.token_index in union), key=lambda t: t.token_index)
+    span = _build_entity_span(union_tokens, entity_type, page.page_num, source="manual")
+    return span, [sid for sid, _ in overlapping], "extended"
+
+
 @app.route("/api/mask-word", methods=["POST"])
 def mask_word():
     """'Mask your own words' — exact (case-insensitive) phrase match
@@ -307,23 +425,29 @@ def mask_word():
         return jsonify({"error": f"Invalid entity_type: {entity_type}"}), 400
 
     document = entry["document"]
-    phrase_lower = phrase.lower()
-    phrase_words = phrase_lower.split()
+    if not _norm_search(phrase):
+        return jsonify({"error": "The phrase has no letters or digits"}), 400
     new_entities = []
+    removed_ids: list[str] = []
+    counts = {"added": 0, "extended": 0, "retyped": 0, "covered": 0}
+    inside_any = False
 
     for page in document.pages:
-        texts_lower = [t.text.lower() for t in page.tokens]
-        n = len(phrase_words)
-        for i in range(len(texts_lower) - n + 1):
-            if texts_lower[i:i + n] != phrase_words:
-                continue
-            match_tokens = page.tokens[i:i + n]
-            span = _build_entity_span(match_tokens, entity_type, page.page_num, source="manual")
-            span_id = uuid.uuid4().hex
-            entry["spans_by_id"][span_id] = span
-            new_entities.append(_span_to_dict(span_id, span, line_no=0))
+        ranges, inside = find_phrase_token_ranges([t.text for t in page.tokens], phrase)
+        inside_any = inside_any or inside
+        for first, last in ranges:
+            span, removed, outcome = merge_manual_match(page, entry["spans_by_id"], first, last, entity_type)
+            counts[outcome] += 1
+            for sid in removed:
+                entry["spans_by_id"].pop(sid, None)
+                removed_ids.append(sid)
+            if span is not None:
+                span_id = uuid.uuid4().hex
+                entry["spans_by_id"][span_id] = span
+                new_entities.append(_span_to_dict(span_id, span, line_no=0))
 
-    return jsonify({"entities": new_entities})
+    return jsonify({"entities": new_entities, "removed_ids": removed_ids, "counts": counts,
+                    "inside_token": inside_any})
 
 
 @app.route("/api/manual-select", methods=["POST"])
@@ -502,7 +626,7 @@ def iob2_dump():
     if file is None or not file.filename:
         return jsonify({"error": "No file uploaded"}), 400
 
-    checkpoint_path = request.form.get("checkpoint", DEFAULT_CHECKPOINT)
+    checkpoint_path = _checkpoint_from_form()
     no_model = request.form.get("no_model") == "true"
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="iob2dump_"))
@@ -545,7 +669,12 @@ def iob2_dump():
         ]
         pages_out.append({"page": page.page_num + 1, "tokens": tokens_out})
 
-    return jsonify({"filename": file.filename, "address_heuristic": heuristic_used, "pages": pages_out})
+    return jsonify({
+        "filename": file.filename,
+        "address_heuristic": heuristic_used,
+        "checkpoint": None if no_model else checkpoint_path,  # model actually used (None = Tier 1 only)
+        "pages": pages_out,
+    })
 
 
 if __name__ == "__main__":
